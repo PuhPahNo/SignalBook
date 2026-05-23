@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SignalBook Console</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand"><span class="brand-mark" aria-hidden="true">S</span><span>SignalBook</span></div>
+      <div class="nav">
+        <button class="active" data-view="signals" data-icon="zap">Signals</button>
+        <button data-view="model" data-icon="target">Model</button>
+        <button data-view="calibrations" data-icon="gauge">Calibration</button>
+        <button data-view="snapshots" data-icon="activity">Snapshots</button>
+        <button data-view="skips" data-icon="filter">Skips</button>
+        <button data-view="settlements" data-icon="coins">Settlements</button>
+        <button data-view="performance" data-icon="chart">Performance</button>
+        <button data-view="health" data-icon="pulse">Provider Health</button>
+        <button data-view="jobs" data-icon="terminal">Jobs</button>
+      </div>
+    </aside>
+    <main>
+      <div class="toolbar">
+        <div>
+          <h1>SignalBook Bot</h1>
+          <div class="subtle">Automatic AIScore scans, paper signals, and settlement tracking</div>
+        </div>
+        <div class="actions">
+          <button class="primary" id="botToggleBtn" data-icon="repeat">Bot Starting</button>
+          <button class="secondary" id="advancedBtn" data-icon="filter">Advanced</button>
+          <button class="secondary" id="reportBtn" data-icon="file">Report</button>
+        </div>
+      </div>
+
+      <div class="sports-tabs" id="sportsTabs"></div>
+      <div class="advanced-panel" id="advancedPanel">
+        <select id="strategy">
+          <option value="">Auto strategy</option>
+        </select>
+        <div class="control"><label>Games</label><input id="limit" type="number" min="1" max="200" value="10"></div>
+        <div class="control"><label>Edge</label><input id="minEv" type="number" min="0" max="1" step="0.01" value="0.03"></div>
+        <div class="control"><label>Every</label><input id="intervalSeconds" type="number" min="5" max="3600" value="60"></div>
+        <div class="subtle">Changing these only applies after pausing and resuming the bot.</div>
+      </div>
+      <div class="strategy-panel" id="strategyPanel"></div>
+
+      <div class="summary" id="summary"></div>
+      <div class="notice" id="interpretation">Loading...</div>
+
+      <section class="view active" id="signals">
+        <div class="panel"><div class="panel-head">Signals <span class="subtle">expected-value candidates</span></div><div id="signalsTable"></div></div>
+      </section>
+      <section class="view" id="model">
+        <div class="panel">
+          <div class="panel-head">
+            <span>Model Criteria <span class="subtle">selected strategy gates</span></span>
+            <button class="secondary mini" id="calibrateBtn" data-icon="gauge">Calibrate Sport</button>
+          </div>
+          <div id="modelDetails"></div>
+        </div>
+      </section>
+      <section class="view" id="calibrations">
+        <div class="panel"><div class="panel-head">Calibration Runs <span class="subtle">free-source baselines and validation status</span></div><div id="calibrationsTable"></div></div>
+      </section>
+      <section class="view" id="snapshots">
+        <div class="panel"><div class="panel-head">Snapshots <span class="subtle">usable live states</span></div><div id="snapshotsTable"></div></div>
+      </section>
+      <section class="view" id="skips">
+        <div class="panel"><div class="panel-head">Skipped Candidates <span class="subtle">why games were not flagged</span></div><div id="skipsTable"></div></div>
+      </section>
+      <section class="view" id="settlements">
+        <div class="panel"><div class="panel-head">Settlements <span class="subtle">paper-trading results</span></div><div id="settlementsTable"></div></div>
+      </section>
+      <section class="view" id="performance">
+        <div class="panel"><div class="panel-head">Performance <span class="subtle">accuracy by sport and strategy</span></div><div id="performanceTable"></div></div>
+      </section>
+      <section class="view" id="health">
+        <div class="panel"><div class="panel-head">Provider Health <span class="subtle">latest scanner diagnostics</span></div><div id="healthTable"></div></div>
+      </section>
+      <section class="view" id="jobs">
+        <div class="panel"><div class="panel-head">Background Jobs <span class="subtle">scan and report command output</span></div></div>
+        <div class="jobs" id="jobsList"></div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
