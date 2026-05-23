@@ -4,19 +4,46 @@ SignalBook is a local multi-sport betting-research tool. It scans AIScore live m
 
 It does not place real bets.
 
-## Setup
+## Requirements
+
+- Python 3.11 or newer.
+- Google Chrome or Chromium installed locally.
+- Internet access for AIScore scraping and optional calibration sources.
+- No paid API services are required.
+
+SignalBook uses Selenium 4, which can manage the matching ChromeDriver automatically on most local machines. If Selenium cannot start Chrome, update Chrome first, then rerun the command.
+
+## Fresh Clone Quickstart
 
 ```bash
-python3 -m venv --system-site-packages .venv
+git clone https://github.com/PuhPahNo/SignalBook.git
+cd SignalBook
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python signalbook.py web
 ```
 
-AIScore-only mode works without API keys. Optional free-tier keys can be set for future cross-check adapters:
+Then open `http://127.0.0.1:8765`.
+
+The web command starts the local dashboard and automatically starts the SignalBook bot. The bot scans supported sports on a loop, stores snapshots/signals in a local SQLite database, and attempts settlement checks for open paper-trading signals.
+
+On Windows, replace `.venv/bin/python` with `.venv\Scripts\python.exe`.
+
+## Optional API Keys
 
 ```bash
 export API_FOOTBALL_KEY="..."
 export THE_ODDS_API_KEY="..."
 ```
+
+AIScore-only mode works without API keys. Optional free-tier keys can be set for future cross-check adapters; missing keys do not break the app.
+
+## Local Files
+
+- `data/quicklin.db` is created automatically on first run and stores local paper-trading history.
+- `output/report/` is created when reports are generated.
+- Both are intentionally ignored by git so personal local results are not pushed publicly.
 
 ## Live Research
 
@@ -60,6 +87,8 @@ Start the local website interface:
 
 Then open `http://127.0.0.1:8765`. The dark web console uses the same SQLite database and scanner commands as the CLI. It includes sport tabs and shows whether the provider found no live match refs, found matches that were skipped, or found matches that cleared the EV threshold.
 
+The dashboard runs locally. Do not expose it directly to the public internet without adding authentication and moving storage to a production database.
+
 ## Historical Baseline
 
 Import free Football-Data.co.uk CSVs and run the baseline backtest:
@@ -78,3 +107,10 @@ This is a historical baseline only. Free public data does not provide historical
 - `tennis_match_totals_v1` stays conservative because a stable free ATP JSON calibration source is not wired in yet.
 
 Outputs are candidate signals for research, not guaranteed profitable bets.
+
+## Troubleshooting
+
+- If Chrome does not launch, update Chrome or install Chromium, then rerun the command.
+- If no signals appear, check the Skips, Provider Health, and Jobs views. The provider may have found no live games, no supported totals odds, or no model edge.
+- If AIScore changes its page markup, parser tests may still pass while live scraping needs an update.
+- Delete `data/quicklin.db` only if you intentionally want to reset local paper-trading history.
