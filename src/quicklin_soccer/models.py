@@ -208,6 +208,25 @@ class LiveSnapshot:
         return self.home_corners + self.away_corners
 
 
+# A real two-sided over/under book's implied probabilities sum to >= 1 — the
+# excess is the bookmaker's margin (overround). A pair summing below this is
+# incoherent: it cannot be a genuine market, so it's a parse artifact. The
+# listing-row parser used to produce such pairs (implied sum ~0.70), which
+# manufactured large phantom EV. We allow a hair under 1.0 for decimal-odds
+# rounding. See is_coherent_two_sided_odds.
+MIN_TWO_SIDED_IMPLIED: float = 0.98
+
+
+def is_coherent_two_sided_odds(over_odds: float | None, under_odds: float | None) -> bool:
+    """True if (over, under) could be a real two-sided total. Both must be
+    decimal odds > 1, and their implied probabilities must sum to ~>= 1."""
+    if over_odds is None or under_odds is None:
+        return False
+    if over_odds <= 1.0 or under_odds <= 1.0:
+        return False
+    return (1.0 / over_odds) + (1.0 / under_odds) >= MIN_TWO_SIDED_IMPLIED
+
+
 @dataclass(frozen=True)
 class OddsQuote:
     provider: str

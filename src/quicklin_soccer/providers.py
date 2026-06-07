@@ -3,7 +3,14 @@ from __future__ import annotations
 from typing import Protocol
 
 from quicklin_soccer.aiscore import AiScoreScraper, BrowserConfig
-from quicklin_soccer.models import LiveSnapshot, MatchRef, OddsQuote, canonical_match_id, now_iso
+from quicklin_soccer.models import (
+    LiveSnapshot,
+    MatchRef,
+    OddsQuote,
+    canonical_match_id,
+    is_coherent_two_sided_odds,
+    now_iso,
+)
 from quicklin_soccer.sports import SPORT_SOCCER, sport_config
 
 
@@ -108,6 +115,13 @@ class AiScoreProvider:
         under_odds: float | None,
     ) -> tuple[OddsQuote, ...]:
         if line is None or over_odds is None or under_odds is None:
+            return ()
+        # Final guardrail: never price an incoherent two-sided book. A real
+        # over/under's implied probabilities sum to >= 1; a pair summing below
+        # that is a parse artifact (the old listing bug produced ~0.70 books,
+        # which read as both-sides +EV). Drop it so the match is treated as
+        # missing odds and can fall through to the estimator instead.
+        if not is_coherent_two_sided_odds(over_odds, under_odds):
             return ()
         base = {
             "provider": self.name,

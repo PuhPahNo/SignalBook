@@ -11,7 +11,13 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 
-from quicklin_soccer.models import HistoricalProfile, MatchRef, MatchStats, now_iso
+from quicklin_soccer.models import (
+    HistoricalProfile,
+    MatchRef,
+    MatchStats,
+    is_coherent_two_sided_odds,
+    now_iso,
+)
 from quicklin_soccer.sports import SPORT_BASEBALL, SPORT_BASKETBALL, SPORT_HOCKEY, SPORT_SOCCER, SPORT_TENNIS, sport_config
 
 
@@ -389,14 +395,18 @@ class AiScoreScraper:
         self._wait_for_body_text()
         self._accept_cookies_if_present()
         match = self._generic_match_payload()
+        body_text = self.driver.find_element(By.TAG_NAME, "body").text
         listing = _parse_listing_match(self._listing_text_by_url.get(url, ""), sport)
-        phase, clock, minute = _generic_time_state(self.driver.find_element(By.TAG_NAME, "body").text, sport)
+        phase, clock, minute = _generic_time_state(body_text, sport)
         phase = listing.get("phase") or phase
         clock = listing.get("clock") or clock
         minute = listing.get("minute") or minute
         odds = _generic_total_odds(match)
         if odds == (None, None, None):
-            odds = listing.get("odds") or odds
+            # Prefer the detail page's in-play total (authoritative, coherent)
+            # over the listing row, which mis-pairs numbers into impossible
+            # books. Listing stays as a last resort only.
+            odds = _parse_detail_total_odds(body_text, sport) or listing.get("odds") or odds
         stats = _generic_stats(match, phase, clock)
         return MatchStats(
             url=url,
@@ -699,6 +709,38 @@ def _period_count(phase: str | None, default: int = 1) -> int:
         return default
     match = re.search(r"(\d+)", phase)
     return _int(match.group(1)) if match else default
+
+
+def _parse_detail_total_odds(text: str, sport: str) -> tuple[float, float, float] | None:
+    """Parse the in-play total market straight off the match detail page, e.g.
+    ``Total Runs / 12.5 / 1.86 / 1.80``. This is the authoritative source: the
+    compact listing row was mis-pairing numbers into incoherent books (implied
+    probabilities summing to ~0.70), which manufactured huge phantom EV and even
+    made the bot bet both sides of the same line.
+
+    The page lists ``<label>`` then repeating ``<line> <over> <under>`` triples
+    (a suspended/absent market shows dashes). We return the first coherent
+    triple — both odds > 1 and implied probabilities summing to ~>= 1 — or None
+    when the market isn't really offered. The coherence check also rejects any
+    accidental misalignment, since a wrong pairing won't sum to a real book."""
+    label = sport_config(sport).total_market.replace("_", " ").lower()  # e.g. "total runs"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if line.lower() != label:
+            continue
+        # Primary triple sits right after the label; a secondary line follows.
+        for base in (index + 1, index + 4):
+            triple = lines[base:base + 3]
+            if len(triple) < 3:
+                continue
+            line_val = _float(triple[0])
+            over = _float(triple[1])
+            under = _float(triple[2])
+            if line_val is None or not is_coherent_two_sided_odds(over, under):
+                continue
+            return line_val, over, under
+        return None
+    return None
 
 
 def _parse_listing_total_odds(lines: list[str]) -> tuple[float | None, float | None, float | None] | None:
