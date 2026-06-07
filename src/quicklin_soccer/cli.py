@@ -27,6 +27,7 @@ from quicklin_soccer.models import (
     ProviderHealth,
     Settlement,
     ValueSignal,
+    is_coherent_two_sided_odds,
     now_iso,
 )
 from quicklin_soccer.odds_estimator import (
@@ -35,6 +36,7 @@ from quicklin_soccer.odds_estimator import (
     OddsEstimator,
     estimated_odds_to_quotes,
 )
+from quicklin_soccer import pinnacle
 from quicklin_soccer.pricing import settle_total_bet
 from quicklin_soccer.providers import AiScoreProvider
 from quicklin_soccer.reporting import write_reports
@@ -88,11 +90,20 @@ def scan_command(args: argparse.Namespace) -> int:
                     )
                 )
                 _print(args, f"Found {len(refs)} live match refs")
+                pinnacle_client, pinnacle_games = _pinnacle_setup(args)
                 for index, ref in enumerate(refs, start=1):
                     _print(args, f"[{index}/{len(refs)}] {ref.home_team} vs {ref.away_team}")
                     match_id = store.upsert_match(ref)
                     try:
                         snapshot, odds_quotes = provider.get_live_snapshot(ref)
+                        # Prefer Pinnacle's live sharp total; AiScore odds are a
+                        # frozen pre-match line. Keep AiScore odds only as a
+                        # fallback when Pinnacle has no match for this game.
+                        pinnacle_quotes = _pinnacle_odds_for(
+                            snapshot, ref, pinnacle_client, pinnacle_games, args.sport
+                        )
+                        if pinnacle_quotes:
+                            odds_quotes = pinnacle_quotes
                         snapshot_id = store.insert_snapshot(match_id, snapshot)
                         odds_ids = {
                             quote.side: store.insert_odds_quote(match_id, quote)
@@ -775,6 +786,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-ev", type=float, default=0.03)
     parser.add_argument("--stake-units", type=float, default=1.0)
     parser.add_argument("--max-odds-age-seconds", type=int, default=120)
+    parser.add_argument(
+        "--odds-source",
+        choices=["pinnacle", "aiscore"],
+        default="pinnacle",
+        help="Odds source. 'pinnacle' (default) uses Pinnacle's live sharp "
+        "totals; AiScore only serves a frozen pre-match line. 'aiscore' keeps "
+        "the legacy behavior. Game state/stats always come from AiScore.",
+    )
 
 
 def _browser_config(args: argparse.Namespace) -> BrowserConfig:
@@ -810,6 +829,7 @@ def _bot_scan_args(args: argparse.Namespace, sport: str) -> argparse.Namespace:
         min_ev=args.min_ev,
         stake_units=args.stake_units,
         max_odds_age_seconds=args.max_odds_age_seconds,
+        odds_source=getattr(args, "odds_source", "pinnacle"),
         output=None,
     )
 
@@ -888,6 +908,39 @@ def _strategy_config(args: argparse.Namespace, strategy: str, calibration_row: A
 def _legacy_signal(provider: AiScoreProvider, ref: MatchRef, history) -> BetSignal | None:
     stats = provider.scraper.match_stats(ref.url, sport=ref.sport)
     return evaluate_match(stats, history)
+
+
+def _pinnacle_setup(args: argparse.Namespace) -> tuple[Any | None, list]:
+    """When the odds source is Pinnacle, build a client and pull the sport's
+    live games once per scan. Returns (client, games); ((None, []) on any
+    failure or when disabled) so the caller silently falls back."""
+    if getattr(args, "odds_source", "pinnacle") != "pinnacle":
+        return None, []
+    try:
+        client = pinnacle.PinnacleClient()
+        games = client.live_games(args.sport)
+        _print(args, f"Pinnacle: {len(games)} live {args.sport} game(s) for odds")
+        return client, games
+    except pinnacle.PinnacleError as exc:
+        _print(args, f"Pinnacle unavailable, falling back to AiScore odds: {exc}")
+        return None, []
+
+
+def _pinnacle_odds_for(snapshot, ref: MatchRef, client, games, sport: str) -> tuple[OddsQuote, ...]:
+    """Live sharp total for one match from Pinnacle, or () if not found/coherent.
+    Joins on team names; AiScore stays the game-state source."""
+    if client is None or not games:
+        return ()
+    game = pinnacle.find_game(ref.home_team, ref.away_team, games)
+    if game is None:
+        return ()
+    try:
+        total = client.main_total(game.matchup_id)
+    except pinnacle.PinnacleError:
+        return ()
+    if total is None or not is_coherent_two_sided_odds(total.over_decimal, total.under_decimal):
+        return ()
+    return pinnacle.to_odds_quotes(total, snapshot, sport)
 
 
 _ODDS_ESTIMATOR = OddsEstimator()
