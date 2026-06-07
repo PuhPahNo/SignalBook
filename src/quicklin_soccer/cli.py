@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import subprocess
 import sys
 import time
@@ -524,6 +525,9 @@ def dedupe_historical_command(args: argparse.Namespace) -> int:
 def settle_command(args: argparse.Namespace) -> int:
     settled = 0
     skipped = 0
+    skip_reasons: dict[str, int] = {}
+    captured = 0
+    capture_dir = getattr(args, "capture_dir", None)
     with QuicklinStore(args.db) as store:
         open_signals = store.open_signals()
         with AiScoreProvider.create(_browser_config(args)) as provider:
@@ -539,9 +543,18 @@ def settle_command(args: argparse.Namespace) -> int:
                     sport=row["sport"] or row["match_sport"] or SPORT_SOCCER,
                 )
                 result = provider.settle_match(ref)
-                if not args.force and not _is_settlement_ready(ref.sport, result):
+                reason = _settlement_skip_reason(ref.sport, result)
+                # Capture the page text for matches stuck on a missing detail
+                # scoreboard — the sample we need to rebuild the parser. Done
+                # regardless of --force, since --force settles on bad scores.
+                if capture_dir is not None and reason == "no_detail_scoreboard":
+                    if _capture_page_text(capture_dir, ref, result):
+                        captured += 1
+                if not args.force and reason is not None:
                     skipped += 1
-                    _print(args, f"skip open signal {row['id']}: match not final")
+                    key = f"{ref.sport}:{reason}"
+                    skip_reasons[key] = skip_reasons.get(key, 0) + 1
+                    _print(args, f"skip open signal {row['id']} ({ref.sport}): {reason}")
                     continue
                 final_total = result["home_score"] + result["away_score"]
                 settlement_result, payout = settle_total_bet(
@@ -564,10 +577,19 @@ def settle_command(args: argparse.Namespace) -> int:
                 settled += 1
                 _print(args, f"settled {row['id']}: {settlement_result} {payout:+.2f}u")
 
+    summary: dict[str, Any] = {"settled": settled, "skipped": skipped, "skip_reasons": skip_reasons}
+    if capture_dir is not None:
+        summary["captured_pages"] = captured
     if args.json:
-        print(json.dumps({"settled": settled, "skipped": skipped}, indent=2))
+        print(json.dumps(summary, indent=2))
     else:
         print(f"Done. Settled {settled}, skipped {skipped}.")
+        if skip_reasons:
+            print("Skip reasons (sport:reason):")
+            for key in sorted(skip_reasons):
+                print(f"  {key}: {skip_reasons[key]}")
+        if capture_dir is not None:
+            print(f"Captured {captured} page-text sample(s) to {capture_dir}.")
     return 0
 
 
@@ -668,6 +690,13 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="(Kept for back-compat — headful is now the default.)")
     settle.add_argument("--wait-timeout", type=int, default=25)
     settle.add_argument("--page-timeout", type=int, default=35)
+    settle.add_argument(
+        "--capture-dir",
+        type=Path,
+        help="Dump raw detail-page text for matches that can't settle "
+        "(non-soccer 'no_detail_scoreboard') so the tennis/baseball "
+        "scoreboard parser can be rebuilt against real samples.",
+    )
     settle.set_defaults(func=settle_command)
 
     backtest = subparsers.add_parser("backtest", help="Import Football-Data CSVs and run historical baseline.")
@@ -789,16 +818,43 @@ def _bot_settle_args(args: argparse.Namespace) -> argparse.Namespace:
     )
 
 
-def _is_settlement_ready(sport: str, result: dict[str, Any]) -> bool:
+def _settlement_skip_reason(sport: str, result: dict[str, Any]) -> str | None:
+    """Why this match can't be settled yet, or None if it's ready.
+
+    Returns a reason string (rather than a bare bool) so the settle pass can
+    log a per-sport breakdown of *why* signals stay open. That breakdown is
+    how the tennis/baseball pile-up gets diagnosed: both sports fail the
+    `no_detail_scoreboard` gate because their inning/set markup never parses
+    into a detail scoreboard upstream."""
     if sport != SPORT_SOCCER and result.get("score_source") != "detail_scoreboard":
-        return False
+        return "no_detail_scoreboard"
     if result.get("is_final"):
-        return True
+        return None
     if result.get("status_id") in {8, 10, 11, 12, 13}:
-        return True
+        return None
     if sport == SPORT_SOCCER:
-        return int(result.get("minute") or 0) >= 90
-    return False
+        return None if int(result.get("minute") or 0) >= 90 else "soccer_under_90"
+    return "not_final"
+
+
+def _is_settlement_ready(sport: str, result: dict[str, Any]) -> bool:
+    return _settlement_skip_reason(sport, result) is None
+
+
+def _capture_page_text(capture_dir: Path, ref: MatchRef, result: dict[str, Any]) -> bool:
+    """Dump the raw detail-page text for a match we couldn't settle, so the
+    tennis/baseball scoreboard parser can be rebuilt against a real sample.
+    Returns True if a file was written."""
+    text = result.get("page_text")
+    if not text:
+        return False
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{ref.sport}_{ref.provider_match_id}")[:120]
+    try:
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        (capture_dir / f"{slug}.txt").write_text(text, encoding="utf-8")
+        return True
+    except OSError:
+        return False
 
 
 def _strategy_config(args: argparse.Namespace, strategy: str, calibration_row: Any | None = None) -> StrategyConfig:

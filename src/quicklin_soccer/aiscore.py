@@ -463,6 +463,12 @@ class AiScoreScraper:
             "is_final": _is_final_state(body_text, sport, match.get("statusId")),
             "score_source": score_source,
             "raw": match,
+            # Kept transiently so the settle pass can dump it for matches that
+            # fail to settle (non-soccer, no detail scoreboard). This is the
+            # only place the raw detail-page text is available; nothing
+            # persists it, which is why the tennis/baseball parser couldn't be
+            # rebuilt offline. Not stored unless --capture-dir is passed.
+            "page_text": body_text,
         }
 
     def _generic_match_payload(self) -> dict:
