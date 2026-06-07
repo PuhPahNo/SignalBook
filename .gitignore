@@ -21,3 +21,9 @@ data/*.db-*
 !.env.example
 *.log
 .DS_Store
+
+# Anthony's local launcher scripts (hardcode ~/Desktop/SignalBook)
+*.command
+
+# FUSE mount filesystem artifacts (sandbox-only, never on Anthony's Mac)
+.fuse_hidden*

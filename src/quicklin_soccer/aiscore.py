@@ -42,7 +42,11 @@ class StatsUnavailable(ScrapeError):
 
 @dataclass(frozen=True)
 class BrowserConfig:
-    headless: bool = True
+    # Default to headed mode — AIScore's bot check (deployed late May 2026)
+    # serves an empty page to headless Chrome even with anti-detection flags.
+    # The CLI's --headful flag is now effectively the default; pass
+    # `headless=True` explicitly to opt back in.
+    headless: bool = False
     wait_timeout: int = 25
     page_load_timeout: int = 35
     window_size: str = "1400,1200"
@@ -65,7 +69,17 @@ class AiScoreScraper:
 
     def live_match_urls(self, limit: int | None = None, max_scrolls: int = 30, sport: str = SPORT_SOCCER) -> list[str]:
         self.driver.get(sport_config(sport).aiscore_url)
-        self._wait_for_body_text()
+        try:
+            WebDriverWait(self.driver, self.config.wait_timeout).until(
+                lambda driver: driver.execute_script(
+                    "return document.querySelectorAll("
+                    "'a.match-container, a[href*=\"/match-\"]').length > 0"
+                )
+            )
+        except TimeoutException:
+            # Genuinely empty slate (no live matches anywhere); fall back to
+            # the old body-text wait so we still return cleanly with [].
+            self._wait_for_body_text()
         self._accept_cookies_if_present()
 
         expected_count = self._displayed_live_count()
@@ -205,15 +219,56 @@ class AiScoreScraper:
 
     def _build_driver(self):
         options = Options()
-        options.add_argument(f"--window-size={self.config.window_size}")
         options.add_argument("--disable-gpu")
         options.add_argument("--lang=en-US")
         options.add_argument("--disable-notifications")
+        # Anti-bot hardening: hide Selenium/Chromedriver fingerprints so
+        # AIScore (and the Cloudflare layer in front of it) doesn't serve
+        # us a stripped JS-stub page with no match elements.
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument(
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+        )
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
         if self.config.headless:
             options.add_argument("--headless=new")
+            # Headless can use the full configured window size — there's no
+            # visible window to hide.
+            options.add_argument(f"--window-size={self.config.window_size}")
+        else:
+            # Headed but unobtrusive on macOS. --window-position with a
+            # large negative value is silently clamped back to (0,0) by
+            # macOS, so the offscreen trick alone doesn't hide anything.
+            # We keep the launch window tiny (so the inevitable flash is
+            # almost imperceptible) and then minimize_window() below to
+            # send it to the Dock.
+            options.add_argument("--window-size=400,400")
+            options.add_argument("--window-position=0,0")
 
         driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(self.config.page_load_timeout)
+        # Send the launched window straight to the Dock so Anthony never
+        # sees a Chrome window on top of his work. Wrapped in try/except
+        # so a Selenium API hiccup doesn't take the whole scan down.
+        if not self.config.headless:
+            try:
+                driver.minimize_window()
+            except WebDriverException:
+                pass
+        # Hide navigator.webdriver before any page JS runs. AIScore's
+        # bot check reads this property; if it returns true we get the
+        # empty-match page that's been killing the scraper.
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": (
+                    "Object.defineProperty(navigator, 'webdriver', "
+                    "{get: () => undefined});"
+                )
+            },
+        )
         return driver
 
     def _wait_for_body_text(self) -> None:

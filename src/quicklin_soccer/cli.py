@@ -3,10 +3,18 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+
+# Path to the repo-root signalbook.py entrypoint, used when the bot needs
+# to spawn an out-of-process settle pass so it doesn't block scanning.
+_SIGNALBOOK_PY = Path(__file__).resolve().parents[2] / "signalbook.py"
+
+import dataclasses
 
 from quicklin_soccer.aiscore import BrowserConfig, StatsUnavailable, classify_error
 from quicklin_soccer.calibration import run_calibrations
@@ -14,10 +22,17 @@ from quicklin_soccer.football_data import backtest_historical_baseline, import_f
 from quicklin_soccer.models import (
     BetSignal,
     MatchRef,
+    OddsQuote,
     ProviderHealth,
     Settlement,
     ValueSignal,
     now_iso,
+)
+from quicklin_soccer.odds_estimator import (
+    MIN_CONFIDENCE as ESTIMATOR_MIN_CONFIDENCE,
+    EstimatedOdds,
+    OddsEstimator,
+    estimated_odds_to_quotes,
 )
 from quicklin_soccer.pricing import settle_total_bet
 from quicklin_soccer.providers import AiScoreProvider
@@ -109,16 +124,58 @@ def scan_command(args: argparse.Namespace) -> int:
                                 summary["skips"] += 1
                                 continue
                             converted = _legacy_to_value_signal(signal, ref, odds_quotes, strategy_config)
+                            converted_odds_source = "market"
+                            converted_odds_confidence = None
+                            estimated_quote_side_to_id: dict[str, int] = {}
                             if converted is None:
-                                _skip(store, args, match_id, snapshot_id, "legacy_missing_odds", {})
-                                summary["skips"] += 1
-                                continue
+                                # Bookmaker didn't post the two-sided total. Try
+                                # the estimator before giving up.
+                                estimate_result = _try_estimate_total_odds(
+                                    store,
+                                    match_id,
+                                    snapshot,
+                                    args.sport,
+                                )
+                                if estimate_result is None:
+                                    _skip(
+                                        store, args, match_id, snapshot_id,
+                                        "legacy_missing_odds",
+                                        {"estimator": "not_attempted_or_below_floor"},
+                                    )
+                                    summary["skips"] += 1
+                                    continue
+                                synthetic_quotes, estimated_quote_side_to_id, estimated = estimate_result
+                                converted = _legacy_to_value_signal(
+                                    signal, ref, synthetic_quotes, strategy_config
+                                )
+                                if converted is None:
+                                    _skip(
+                                        store, args, match_id, snapshot_id,
+                                        "legacy_missing_odds",
+                                        {"estimator": "side_unavailable"},
+                                    )
+                                    summary["skips"] += 1
+                                    continue
+                                converted_odds_source = f"estimated_{estimated.method}"
+                                converted_odds_confidence = estimated.confidence
+                            if converted_odds_source != "market":
+                                converted = dataclasses.replace(
+                                    converted,
+                                    odds_source=converted_odds_source,
+                                    odds_confidence=converted_odds_confidence,
+                                    reason_codes=(*converted.reason_codes, converted_odds_source),
+                                )
+                            signal_quote_id = (
+                                estimated_quote_side_to_id.get(converted.side)
+                                if converted_odds_source != "market"
+                                else odds_ids.get(converted.side)
+                            )
                             signal_id, is_new = _insert_signal_if_new(
                                 store,
                                 match_id,
                                 snapshot_id,
                                 None,
-                                odds_ids.get(converted.side),
+                                signal_quote_id,
                                 converted,
                             )
                             if not is_new:
@@ -134,22 +191,64 @@ def scan_command(args: argparse.Namespace) -> int:
                             evaluation = evaluate_ev_totals(snapshot, odds_quotes, history, strategy_config)
                         else:
                             evaluation = evaluate_sport_totals(snapshot, odds_quotes, strategy_config)
+
+                        # If the strategy bailed only because the bookmaker
+                        # didn't post a two-sided total, ask the estimator
+                        # for a synthetic market and re-evaluate against it.
+                        estimator_odds_ids: dict[str, int] = {}
+                        estimator_metadata: EstimatedOdds | None = None
+                        if (
+                            evaluation.skip_reason == "missing_two_sided_total_odds"
+                            and not evaluation.signals
+                        ):
+                            estimate_result = _try_estimate_total_odds(
+                                store, match_id, snapshot, args.sport,
+                            )
+                            if estimate_result is not None:
+                                synthetic_quotes, estimator_odds_ids, estimator_metadata = estimate_result
+                                combined_quotes = (*odds_quotes, *synthetic_quotes)
+                                if args.sport == SPORT_SOCCER:
+                                    evaluation = evaluate_ev_totals(
+                                        snapshot, combined_quotes, history, strategy_config
+                                    )
+                                else:
+                                    evaluation = evaluate_sport_totals(
+                                        snapshot, combined_quotes, strategy_config
+                                    )
+
                         prediction_id = None
                         if evaluation.prediction:
                             prediction_id = store.insert_prediction(match_id, snapshot_id, evaluation.prediction)
 
                         if not evaluation.signals:
-                            _skip(store, args, match_id, snapshot_id, evaluation.skip_reason or "no_signal", evaluation.details)
+                            skip_details = dict(evaluation.details or {})
+                            if estimator_metadata is not None:
+                                skip_details["estimator_method"] = estimator_metadata.method
+                                skip_details["estimator_confidence"] = estimator_metadata.confidence
+                            _skip(store, args, match_id, snapshot_id, evaluation.skip_reason or "no_signal", skip_details)
                             summary["skips"] += 1
                             continue
 
                         for signal in evaluation.signals:
+                            if estimator_metadata is not None:
+                                # Tag the synthesized side(s) so the dashboard
+                                # and PnL analytics can split estimated vs
+                                # market-priced trades.
+                                signal = dataclasses.replace(
+                                    signal,
+                                    odds_source=f"estimated_{estimator_metadata.method}",
+                                    odds_confidence=estimator_metadata.confidence,
+                                    reason_codes=(*signal.reason_codes, f"estimated_{estimator_metadata.method}"),
+                                )
+                                quote_id_for_signal = estimator_odds_ids.get(signal.side, odds_ids.get(signal.side))
+                            else:
+                                quote_id_for_signal = odds_ids.get(signal.side)
                             signal_id, is_new = _insert_signal_if_new(
                                 store,
                                 match_id,
                                 snapshot_id,
                                 prediction_id,
-                                odds_ids.get(signal.side),
+                                quote_id_for_signal,
                                 signal,
                             )
                             if not is_new:
@@ -199,8 +298,19 @@ def _insert_signal_if_new(
     odds_quote_id: int | None,
     signal: ValueSignal,
 ) -> tuple[int, bool]:
+    """Emit a new paper trade if there isn't already an OPEN one for this
+    match+sport+strategy+side. Otherwise log the would-have-emitted line
+    and odds to line_movements (for post-hoc EV analysis) and return the
+    existing signal's id. Estimated signals route through the same path,
+    so the dedup behavior applies identically to market and estimated."""
     existing_id = store.emitted_signal_id(match_id, signal)
     if existing_id is not None:
+        try:
+            store.insert_line_movement(existing_id, match_id, signal)
+        except Exception:
+            # Line-movement logging is best-effort; never fail the scan
+            # just because the analytics insert had trouble.
+            pass
         return existing_id, False
     return store.insert_signal(match_id, snapshot_id, prediction_id, odds_quote_id, signal), True
 
@@ -225,10 +335,16 @@ def bot_command(args: argparse.Namespace) -> int:
     sports = _bot_sports(args.sports)
     loops = 0
     last_settle_at = 0.0
+    # Settle is run in a separate Python process so a long pass over hundreds
+    # of open signals doesn't block the scan loop. We only ever keep one
+    # settle process alive at a time; if the previous one hasn't finished
+    # by the time the next settle window opens, we skip and try again later.
+    settle_proc: subprocess.Popen | None = None
     print(
         "SignalBook bot running: "
         f"scanning {', '.join(sports)} every {args.scan_interval_seconds}s; "
-        f"settling every {args.settle_interval_seconds}s."
+        f"settling every {args.settle_interval_seconds}s "
+        f"(settle runs in a background subprocess so it does not block scans)."
     )
     while args.loops is None or loops < args.loops:
         loops += 1
@@ -243,19 +359,166 @@ def bot_command(args: argparse.Namespace) -> int:
             except Exception as exc:
                 print(f"{sport}: scan failed but bot is continuing: {classify_error(exc)}")
 
+        # Reap a finished settle subprocess so we can launch a fresh one.
+        if settle_proc is not None and settle_proc.poll() is not None:
+            print(
+                f"settle subprocess pid={settle_proc.pid} finished "
+                f"with exit code {settle_proc.returncode}"
+            )
+            settle_proc = None
+
         now = time.monotonic()
         if now - last_settle_at >= args.settle_interval_seconds:
-            try:
-                settle_command(_bot_settle_args(args))
-            except Exception as exc:
-                print(f"settlement pass failed but bot is continuing: {classify_error(exc)}")
-            last_settle_at = time.monotonic()
+            if settle_proc is not None:
+                print(
+                    f"settle subprocess pid={settle_proc.pid} is still running; "
+                    "deferring next settle pass."
+                )
+            else:
+                settle_proc = _spawn_settle_subprocess(args)
+                if settle_proc is not None:
+                    last_settle_at = time.monotonic()
 
         if args.loops is not None and loops >= args.loops:
             break
         elapsed = time.monotonic() - loop_started
         time.sleep(max(0, args.scan_interval_seconds - elapsed))
+
+    # On bot shutdown, wait for any lingering settle subprocess so we don't
+    # leave an orphaned Chrome instance running on Anthony's desktop.
+    if settle_proc is not None and settle_proc.poll() is None:
+        print(f"waiting for settle subprocess pid={settle_proc.pid} to finish...")
+        try:
+            settle_proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            print("settle subprocess did not finish in 120s; terminating.")
+            settle_proc.terminate()
     return 0
+
+
+def _spawn_settle_subprocess(args: argparse.Namespace) -> subprocess.Popen | None:
+    """Spawn `signalbook.py settle` as an independent process so its
+    Chrome driver is isolated from the scanner's and SQLite writes don't
+    contend in the same connection."""
+    cmd = [sys.executable, str(_SIGNALBOOK_PY), "settle", "--db", str(args.db)]
+    if getattr(args, "headless", False):
+        cmd.append("--headless")
+    try:
+        proc = subprocess.Popen(cmd)
+        print(f"settle subprocess pid={proc.pid} started ({' '.join(cmd)})")
+        return proc
+    except Exception as exc:
+        print(f"failed to start settle subprocess: {classify_error(exc)}")
+        return None
+
+
+# New `status` value used by dedupe-historical. The settle flow filters on
+# status='open', so superseded rows are inert — they will not be re-fetched
+# from AIScore and will not produce new settlement rows.
+SUPERSEDED_STATUS = "superseded"
+
+
+def dedupe_historical_command(args: argparse.Namespace) -> int:
+    """One-shot cleanup. For each (match_id, sport, strategy_version, side)
+    group with more than one value_signal row, keep the EARLIEST (lowest id)
+    and mark every subsequent row 'superseded'. Default behavior is a
+    dry-run that prints the summary; pass --apply to actually mutate.
+
+    Anthony's win/loss tallies were double-counting matches because the
+    pre-fix dedup keyed on line. This script collapses the history to one
+    paper trade per (match, side, strategy) — matching the new live
+    behavior — so historical PnL stops over-counting."""
+    import sqlite3
+
+    if args.apply and args.dry_run:
+        raise SystemExit("--apply and --dry-run are mutually exclusive.")
+    dry_run = not args.apply  # default is dry-run
+
+    conn = sqlite3.connect(args.db)
+    conn.row_factory = sqlite3.Row
+    try:
+        # Survey first: how many rows total, how many groups have dupes,
+        # how many would be marked superseded.
+        groups = list(conn.execute("""
+            SELECT match_id, sport, strategy_version, side,
+                   COUNT(*) AS n_rows,
+                   MIN(id) AS keep_id,
+                   GROUP_CONCAT(id) AS all_ids,
+                   GROUP_CONCAT(DISTINCT status) AS statuses
+            FROM value_signals
+            GROUP BY match_id, sport, strategy_version, side
+            HAVING n_rows > 1
+            ORDER BY n_rows DESC
+        """))
+        total_signals_before = conn.execute("SELECT COUNT(*) FROM value_signals").fetchone()[0]
+        affected_matches = len({(g["match_id"], g["sport"]) for g in groups})
+        rows_to_supersede = sum(g["n_rows"] - 1 for g in groups)
+        rows_that_remain = total_signals_before - rows_to_supersede
+
+        # Per-sport breakdown.
+        per_sport: dict[str, dict[str, int]] = {}
+        for g in groups:
+            d = per_sport.setdefault(g["sport"], {"groups": 0, "supersede": 0})
+            d["groups"] += 1
+            d["supersede"] += g["n_rows"] - 1
+
+        mode = "DRY-RUN" if dry_run else "APPLY"
+        print(f"[{mode}] dedupe-historical against {args.db}")
+        print(f"  before: {total_signals_before} total value_signals")
+        print(f"  dup groups (more than one row per match+sport+strategy+side): {len(groups)}")
+        print(f"  affected matches: {affected_matches}")
+        print(f"  rows to mark '{SUPERSEDED_STATUS}': {rows_to_supersede}")
+        print(f"  rows that will remain: {rows_that_remain}")
+        print("  per sport:")
+        for sport in sorted(per_sport):
+            d = per_sport[sport]
+            print(f"    {sport:11} dup_groups={d['groups']:>4}  supersede_rows={d['supersede']:>5}")
+
+        # Show top 5 worst offenders so Anthony can sanity check.
+        if groups:
+            print("\n  worst-offender groups (top 5 by row count):")
+            for g in groups[:5]:
+                ids = sorted(int(i) for i in g["all_ids"].split(",") if i)
+                keep = int(g["keep_id"])
+                supersede = [str(i) for i in ids if i != keep]
+                shown = supersede[:5]
+                tail = "..." if len(supersede) > len(shown) else ""
+                print(f"    match={g['match_id']} {g['sport']:8} strat={g['strategy_version']:25} "
+                      f"side={g['side']:5} n={g['n_rows']} keep_id={keep} "
+                      f"supersede_ids={','.join(shown)}{tail} statuses={g['statuses']}")
+
+        if dry_run:
+            print(f"\n[{mode}] no changes written. Re-run with --apply to actually mutate.")
+            return 0
+
+        # Apply: mark every non-earliest row 'superseded'.
+        updated = 0
+        with conn:
+            for g in groups:
+                cur = conn.execute(
+                    """
+                    UPDATE value_signals
+                    SET status = ?
+                    WHERE match_id = ?
+                      AND sport = ?
+                      AND strategy_version = ?
+                      AND side = ?
+                      AND id != ?
+                    """,
+                    (SUPERSEDED_STATUS, g["match_id"], g["sport"],
+                     g["strategy_version"], g["side"], g["keep_id"]),
+                )
+                updated += cur.rowcount
+        print(f"\n[{mode}] complete. {updated} rows marked '{SUPERSEDED_STATUS}'.")
+        # Verify net count.
+        after = conn.execute(
+            "SELECT COUNT(*) FROM value_signals WHERE status != ?",
+            (SUPERSEDED_STATUS,),
+        ).fetchone()[0]
+        print(f"  rows now NOT superseded: {after}")
+        return 0
+    finally:
+        conn.close()
 
 
 def settle_command(args: argparse.Namespace) -> int:
@@ -382,7 +645,11 @@ def _build_parser() -> argparse.ArgumentParser:
     bot.add_argument("--scan-interval-seconds", type=int, default=60)
     bot.add_argument("--settle-interval-seconds", type=int, default=300)
     bot.add_argument("--loops", type=int, help="Number of bot loops. Omit for continuous bot mode.")
-    bot.add_argument("--headful", action="store_true", help="Show Chrome while scraping.")
+    # Headed Chrome is now the default — see scan parser comment above.
+    bot.add_argument("--headless", action="store_true",
+                     help="Run Chrome headless (will be detected by AIScore).")
+    bot.add_argument("--headful", action="store_true",
+                     help="(Kept for back-compat — headful is now the default.)")
     bot.add_argument("--include-skipped", action="store_true")
     bot.add_argument("--wait-timeout", type=int, default=25)
     bot.add_argument("--page-timeout", type=int, default=35)
@@ -395,7 +662,10 @@ def _build_parser() -> argparse.ArgumentParser:
     settle.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     settle.add_argument("--force", action="store_true", help="Settle even if AIScore does not look final yet.")
     settle.add_argument("--json", action="store_true")
-    settle.add_argument("--headful", action="store_true")
+    settle.add_argument("--headless", action="store_true",
+                        help="Run Chrome headless (will be detected by AIScore).")
+    settle.add_argument("--headful", action="store_true",
+                        help="(Kept for back-compat — headful is now the default.)")
     settle.add_argument("--wait-timeout", type=int, default=25)
     settle.add_argument("--page-timeout", type=int, default=35)
     settle.set_defaults(func=settle_command)
@@ -428,6 +698,24 @@ def _build_parser() -> argparse.ArgumentParser:
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8765)
     web.set_defaults(func=web_command)
+
+    dedupe = subparsers.add_parser(
+        "dedupe-historical",
+        help="One-shot: collapse duplicate signals per (match,sport,strategy,side) to a single 'open' or 'settled' row, marking the rest 'superseded'. Default is --dry-run.",
+    )
+    dedupe.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    dedupe.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually mutate the DB. Without this flag the command runs in dry-run mode and prints what it WOULD do.",
+    )
+    dedupe.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Explicit dry-run (default behavior). Mutually exclusive with --apply.",
+    )
+    dedupe.set_defaults(func=dedupe_historical_command)
+
     return parser
 
 
@@ -435,7 +723,13 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
     parser.add_argument("--sport", choices=SUPPORTED_SPORTS, default=SPORT_SOCCER)
     parser.add_argument("--limit", type=int, help="Maximum live matches to scan.")
-    parser.add_argument("--headful", action="store_true", help="Show Chrome while scraping.")
+    # Headed Chrome is now the default — AIScore's bot check serves an
+    # empty page to headless Chrome. --headless lets you opt back in.
+    # --headful kept as a silent no-op for back-compat with old scripts.
+    parser.add_argument("--headless", action="store_true",
+                        help="Run Chrome headless (will be detected by AIScore as of late May 2026).")
+    parser.add_argument("--headful", action="store_true",
+                        help="(Kept for back-compat — headful is now the default.)")
     parser.add_argument("--include-skipped", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--wait-timeout", type=int, default=25)
@@ -448,7 +742,7 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 def _browser_config(args: argparse.Namespace) -> BrowserConfig:
     return BrowserConfig(
-        headless=not args.headful,
+        headless=getattr(args, "headless", False),
         wait_timeout=args.wait_timeout,
         page_load_timeout=args.page_timeout,
     )
@@ -469,7 +763,8 @@ def _bot_scan_args(args: argparse.Namespace, sport: str) -> argparse.Namespace:
         db=args.db,
         sport=sport,
         limit=args.limit,
-        headful=args.headful,
+        headless=getattr(args, "headless", False),
+        headful=getattr(args, "headful", False),
         include_skipped=args.include_skipped,
         json=False,
         wait_timeout=args.wait_timeout,
@@ -487,7 +782,8 @@ def _bot_settle_args(args: argparse.Namespace) -> argparse.Namespace:
         db=args.db,
         force=False,
         json=False,
-        headful=args.headful,
+        headless=getattr(args, "headless", False),
+        headful=getattr(args, "headful", False),
         wait_timeout=args.wait_timeout,
         page_timeout=args.page_timeout,
     )
@@ -528,6 +824,41 @@ def _strategy_config(args: argparse.Namespace, strategy: str, calibration_row: A
 def _legacy_signal(provider: AiScoreProvider, ref: MatchRef, history) -> BetSignal | None:
     stats = provider.scraper.match_stats(ref.url, sport=ref.sport)
     return evaluate_match(stats, history)
+
+
+_ODDS_ESTIMATOR = OddsEstimator()
+
+
+def _try_estimate_total_odds(
+    store: QuicklinStore,
+    match_id: int,
+    snapshot,
+    sport: str,
+) -> tuple[tuple[OddsQuote, OddsQuote], dict[str, int], EstimatedOdds] | None:
+    """Run OddsEstimator against a snapshot whose bookmaker odds are missing.
+    If the estimator returns a payload at or above the confidence floor,
+    persist the synthetic odds_quotes (so signals reference real ids) and
+    return the wrapped quotes, their per-side row ids, and the estimator
+    metadata. Returns None when estimation isn't possible or fails the
+    confidence floor."""
+    estimated = _ODDS_ESTIMATOR.estimate(snapshot, sport)
+    if estimated is None:
+        return None
+    if estimated.confidence < ESTIMATOR_MIN_CONFIDENCE:
+        return None
+    try:
+        over_quote, under_quote = estimated_odds_to_quotes(estimated, snapshot, sport)
+    except Exception:
+        return None
+    side_to_id: dict[str, int] = {}
+    for quote in (over_quote, under_quote):
+        try:
+            side_to_id[quote.side] = store.insert_odds_quote(match_id, quote)
+        except Exception:
+            # If we can't persist the synthetic quotes, we'd still rather
+            # skip than emit a signal whose odds_quote_id is bogus.
+            return None
+    return (over_quote, under_quote), side_to_id, estimated
 
 
 def _legacy_to_value_signal(

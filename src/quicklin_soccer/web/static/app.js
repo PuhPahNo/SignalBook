@@ -326,17 +326,23 @@ function betSlip(rows) {
   }
   return `
     <div class="slip-board">
-      ${openRows.map((row) => `
-        <article class="bet-card ${row.side === "over" ? "over-card" : "under-card"}">
+      ${openRows.map((row) => {
+        const isEstimated = row.odds_source && row.odds_source !== "market";
+        const estTag = isEstimated
+          ? `<span class="badge estimated-badge" title="Odds were estimated by SignalBook because the bookmaker did not post a two-sided total. ${escapeHtml(row.odds_source)}, confidence ${escapeHtml(formatPercent(row.odds_confidence))}.">[ESTIMATED] ${escapeHtml(formatPercent(row.odds_confidence))}</span>`
+          : "";
+        return `
+        <article class="bet-card ${row.side === "over" ? "over-card" : "under-card"} ${isEstimated ? "estimated-card" : ""}">
           <div class="bet-top">
             <span class="badge ${badgeClass(row.sport)}">${escapeHtml(row.sport)}</span>
             <span class="badge ${badgeClass(row.side)}">${escapeHtml(row.side)}</span>
+            ${estTag}
             <span class="freshness">${escapeHtml(relativeAge(row.created_at))}</span>
           </div>
           <div class="bet-pick">${escapeHtml(row.side.toUpperCase())} ${escapeHtml(row.line)}</div>
           <div class="bet-match">${escapeHtml(row.match)}</div>
           <div class="bet-grid">
-            <div><span>Odds</span><strong>${escapeHtml(formatNumber(row.offered_odds, 2))}</strong></div>
+            <div><span>Odds${isEstimated ? " (est)" : ""}</span><strong>${escapeHtml(formatNumber(row.offered_odds, 2))}</strong></div>
             <div><span>Stake</span><strong>${escapeHtml(formatNumber(row.stake_units, 2))}u</strong></div>
             <div><span>Model fair</span><strong>${escapeHtml(formatNumber(row.fair_odds, 2))}</strong></div>
             <div><span>Edge</span><strong>${escapeHtml(formatPercent(row.ev))}</strong></div>
@@ -344,10 +350,12 @@ function betSlip(rows) {
           <div class="bet-meta">
             <span>${escapeHtml(row.strategy_version)}</span>
             <span>confidence ${escapeHtml(formatPercent(row.confidence))}</span>
+            ${isEstimated ? `<span class="estimated-source">${escapeHtml(row.odds_source)}</span>` : ""}
           </div>
           <a class="bet-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">${icon("external")}Open AIScore</a>
         </article>
-      `).join("")}
+      `;
+      }).join("")}
     </div>
     <div class="slip-note">Paper-trading candidates only. Check the live book line/odds before acting; odds move fast.</div>
   `;
@@ -366,6 +374,8 @@ function columnsFor(kind, sample) {
       { key: "fair_odds", label: "Fair" },
       { key: "ev", label: "EV", pct: true },
       { key: "confidence", label: "Conf", pct: true },
+      { key: "odds_source", label: "Odds source", badge: true },
+      { key: "odds_confidence", label: "Est. conf", pct: true },
       { key: "status", label: "Status", badge: true },
     ],
     snapshots: [

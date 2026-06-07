@@ -224,6 +224,13 @@ class OddsQuote:
     is_blocked: bool = False
     sport: str = "soccer"
     raw: dict[str, Any] = field(default_factory=dict)
+    # Estimator-related fields. is_estimated=True means decimal_odds was
+    # synthesized by OddsEstimator because the bookmaker didn't post the
+    # two-sided total. estimation_method names the model used; confidence
+    # is in [0,1] with 0.50 the live-bot's emit floor.
+    is_estimated: bool = False
+    estimation_method: str | None = None
+    estimation_confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -267,10 +274,20 @@ class ValueSignal:
     bookmaker: str
     reason_codes: tuple[str, ...] = field(default_factory=tuple)
     sport: str = "soccer"
+    # When odds_source != 'market', the offered_odds came from OddsEstimator
+    # rather than a bookmaker quote. odds_confidence is the estimator's
+    # confidence in [0,1]; it's stored on the signal so the dashboard and
+    # post-hoc analytics can split estimated vs market-priced PnL.
+    odds_source: str = "market"
+    odds_confidence: float | None = None
 
     @property
     def expected_total_remaining(self) -> float:
         return self.expected_goals_remaining
+
+    @property
+    def is_estimated(self) -> bool:
+        return self.odds_source != "market"
 
     def as_row(self) -> dict[str, Any]:
         return {
@@ -292,6 +309,8 @@ class ValueSignal:
             "strategy_version": self.strategy_version,
             "reasons": ",".join(self.reason_codes),
             "url": self.url,
+            "odds_source": self.odds_source,
+            "odds_confidence": round(self.odds_confidence, 3) if self.odds_confidence is not None else None,
         }
 
 

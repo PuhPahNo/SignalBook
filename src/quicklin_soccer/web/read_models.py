@@ -81,7 +81,8 @@ def signals_query(sport: str | None = None) -> str:
                value_signals.line, value_signals.offered_odds, value_signals.fair_probability,
                value_signals.fair_odds, value_signals.ev, value_signals.stake_units,
                value_signals.expected_goals_remaining, value_signals.confidence,
-               value_signals.status, matches.url
+               value_signals.status, matches.url,
+               value_signals.odds_source, value_signals.odds_confidence
         FROM value_signals
         JOIN matches ON matches.id = value_signals.match_id
         """ + _where_sport(sport, "value_signals") + """
