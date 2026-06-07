@@ -369,10 +369,19 @@ def _add_vig(
     fair_over_prob: float, fair_under_prob: float, vig_per_side: float
 ) -> tuple[float, float]:
     """Apply a per-side vig so the synthesized odds look like a real book.
-    Without this the EV math compares a no-vig synthesised price to a
-    no-vig synthesised price and almost always lands at zero EV."""
-    over_with_vig = fair_over_prob / (1 + vig_per_side)
-    under_with_vig = fair_under_prob / (1 + vig_per_side)
+
+    A real book's two implied probabilities sum to MORE than 1 — that
+    overround is the house margin. So the vig must INFLATE each implied
+    probability (shortening the decimal odds), making the offered price
+    slightly worse than fair. Dividing instead would synthesize a book
+    paying out >100%, injecting a phantom ~vig of positive EV into every
+    estimated signal. We deliberately want estimated odds to land at
+    slightly-negative EV against our own model: you cannot extract a real
+    edge from a price you synthesized from that same model. The estimator
+    earns matches onto the watchlist via its confidence floor, not by
+    manufacturing EV."""
+    over_with_vig = fair_over_prob * (1 + vig_per_side)
+    under_with_vig = fair_under_prob * (1 + vig_per_side)
     over_decimal = 1.0 / max(over_with_vig, 1e-6)
     under_decimal = 1.0 / max(under_with_vig, 1e-6)
     return round(over_decimal, 3), round(under_decimal, 3)
