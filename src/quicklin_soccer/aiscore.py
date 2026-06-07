@@ -512,13 +512,24 @@ def _generic_provider_match_id(url: str) -> str:
 
 
 def _is_final_state(text: str, sport: str, status_id=None) -> bool:
-    if sport != SPORT_SOCCER and _has_live_state(text, sport):
-        return False
+    normalized = text.replace("\n", " ")
+    # Unambiguous final markers. These never appear in AiScore's page
+    # boilerplate, so they're authoritative even when the scoreboard still
+    # shows set/inning labels that _has_live_state would otherwise read as
+    # live — the exact bug that kept finished tennis and baseball matches
+    # from ever settling.
+    strong_final = ("Full Time", "Finished", "Ended", "After Penalties", "AET")
+    if any(re.search(rf"\b{re.escape(token)}\b", normalized, re.IGNORECASE) for token in strong_final):
+        return True
     if status_id in {8, 10, 11, 12, 13}:
         return True
-    normalized = text.replace("\n", " ")
-    final_tokens = ("FT", "Full Time", "Finished", "Ended", "After Penalties", "AET", "Final")
-    return any(re.search(rf"\b{re.escape(token)}\b", normalized, re.IGNORECASE) for token in final_tokens)
+    # No explicit final marker: if the page still shows a live clock/period,
+    # it's in progress. This guards the weak "Final" token below against the
+    # "...halftime or final result." boilerplate on every live page.
+    if sport != SPORT_SOCCER and _has_live_state(text, sport):
+        return False
+    weak_final = ("FT", "Final")
+    return any(re.search(rf"\b{re.escape(token)}\b", normalized, re.IGNORECASE) for token in weak_final)
 
 
 def _has_live_state(text: str, sport: str) -> bool:
@@ -613,6 +624,10 @@ def _parse_detail_scoreboard(
     away_team: str | None,
     sport: str,
 ) -> tuple[int, int] | None:
+    # Tennis is special: the top scoreboard shows SETS won, but the bet is on
+    # total games. Sum the per-set summaries instead. See _tennis_total_games.
+    if sport == SPORT_TENNIS:
+        return _tennis_total_games(text)
     if not home_team or not away_team:
         return None
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -626,16 +641,32 @@ def _parse_detail_scoreboard(
         home_score = _int(lines[index + 1])
         away_score = _int(lines[index + 3])
         phase_line = lines[index + 2]
-        if sport == SPORT_HOCKEY and not re.search(r"\b(P[1-3]|OT|SO|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
+        # "Full" matches the "Full Time" label AiScore shows on a finished
+        # match — without it, completed games were rejected and never settled.
+        if sport == SPORT_HOCKEY and not re.search(r"\b(P[1-3]|OT|SO|Full|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
             continue
-        if sport == SPORT_BASKETBALL and not re.search(r"\b(Q[1-4]|OT|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
+        if sport == SPORT_BASKETBALL and not re.search(r"\b(Q[1-4]|OT|Full|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
             continue
-        if sport == SPORT_BASEBALL and not re.search(r"\b(Inning|Top|Bottom|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
-            continue
-        if sport == SPORT_TENNIS and not re.search(r"\b(S[1-5]|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
+        if sport == SPORT_BASEBALL and not re.search(r"\b(Inning|Top|Bottom|Full|FT|Final|Finished)\b", phase_line, re.IGNORECASE):
             continue
         return home_score, away_score
     return None
+
+
+def _tennis_total_games(text: str) -> tuple[int, int] | None:
+    """Total games per player for a finished tennis match, summed from the
+    per-set summaries AiScore prints (e.g. ``S1, 2-6``). The headline
+    scoreboard only shows sets won (2-1), but tennis totals settle on games,
+    so we sum every set's score. Order follows the scoreboard (home first);
+    for a totals bet only the sum matters. Returns None when no completed-set
+    summaries are present (e.g. a retirement), so the match is left unsettled
+    rather than graded on a partial score."""
+    sets = re.findall(r"\bS[1-5],\s*(\d+)\s*-\s*(\d+)", text)
+    if not sets:
+        return None
+    home = sum(int(home_games) for home_games, _ in sets)
+    away = sum(int(away_games) for _, away_games in sets)
+    return home, away
 
 
 def _listing_phase_index(lines: list[str], sport: str) -> int | None:

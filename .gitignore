@@ -14,6 +14,8 @@ dist/
 output/
 data/*.db
 data/*.db-*
+# Throwaway page-text dumps from `settle --capture-dir` / tools/capture_pages.py.
+data/debug/
 *.sqlite
 *.sqlite3
 .env
