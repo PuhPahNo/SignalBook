@@ -525,6 +525,7 @@ def dedupe_historical_command(args: argparse.Namespace) -> int:
 def settle_command(args: argparse.Namespace) -> int:
     settled = 0
     skipped = 0
+    errors = 0
     skip_reasons: dict[str, int] = {}
     captured = 0
     capture_dir = getattr(args, "capture_dir", None)
@@ -542,48 +543,55 @@ def settle_command(args: argparse.Namespace) -> int:
                     start_time=row["start_time"],
                     sport=row["sport"] or row["match_sport"] or SPORT_SOCCER,
                 )
-                result = provider.settle_match(ref)
-                reason = _settlement_skip_reason(ref.sport, result)
-                # Capture the page text for matches stuck on a missing detail
-                # scoreboard — the sample we need to rebuild the parser. Done
-                # regardless of --force, since --force settles on bad scores.
-                if capture_dir is not None and reason == "no_detail_scoreboard":
-                    if _capture_page_text(capture_dir, ref, result):
-                        captured += 1
-                if not args.force and reason is not None:
-                    skipped += 1
-                    key = f"{ref.sport}:{reason}"
-                    skip_reasons[key] = skip_reasons.get(key, 0) + 1
-                    _print(args, f"skip open signal {row['id']} ({ref.sport}): {reason}")
+                # Isolate each match: a stale/404 URL or a parse hiccup on one
+                # open signal must not abort settling the rest of the backlog.
+                try:
+                    result = provider.settle_match(ref)
+                    reason = _settlement_skip_reason(ref.sport, result)
+                    # Capture the page text for matches stuck on a missing detail
+                    # scoreboard — the sample we need to rebuild the parser. Done
+                    # regardless of --force, since --force settles on bad scores.
+                    if capture_dir is not None and reason == "no_detail_scoreboard":
+                        if _capture_page_text(capture_dir, ref, result):
+                            captured += 1
+                    if not args.force and reason is not None:
+                        skipped += 1
+                        key = f"{ref.sport}:{reason}"
+                        skip_reasons[key] = skip_reasons.get(key, 0) + 1
+                        _print(args, f"skip open signal {row['id']} ({ref.sport}): {reason}")
+                        continue
+                    final_total = result["home_score"] + result["away_score"]
+                    settlement_result, payout = settle_total_bet(
+                        final_total,
+                        row["line"],
+                        row["side"],
+                        row["offered_odds"],
+                        row["stake_units"],
+                    )
+                    settlement = Settlement(
+                        signal_id=row["id"],
+                        match_id=row["match_id"],
+                        settled_at=now_iso(),
+                        final_home_score=result["home_score"],
+                        final_away_score=result["away_score"],
+                        result=settlement_result,
+                        payout_units=payout,
+                    )
+                    store.insert_settlement(settlement, result.get("raw"))
+                    settled += 1
+                    _print(args, f"settled {row['id']}: {settlement_result} {payout:+.2f}u")
+                except Exception as exc:
+                    errors += 1
+                    _print(args, f"error settling signal {row['id']} ({ref.sport}): {classify_error(exc)}")
                     continue
-                final_total = result["home_score"] + result["away_score"]
-                settlement_result, payout = settle_total_bet(
-                    final_total,
-                    row["line"],
-                    row["side"],
-                    row["offered_odds"],
-                    row["stake_units"],
-                )
-                settlement = Settlement(
-                    signal_id=row["id"],
-                    match_id=row["match_id"],
-                    settled_at=now_iso(),
-                    final_home_score=result["home_score"],
-                    final_away_score=result["away_score"],
-                    result=settlement_result,
-                    payout_units=payout,
-                )
-                store.insert_settlement(settlement, result.get("raw"))
-                settled += 1
-                _print(args, f"settled {row['id']}: {settlement_result} {payout:+.2f}u")
 
-    summary: dict[str, Any] = {"settled": settled, "skipped": skipped, "skip_reasons": skip_reasons}
+    summary: dict[str, Any] = {"settled": settled, "skipped": skipped, "errors": errors, "skip_reasons": skip_reasons}
     if capture_dir is not None:
         summary["captured_pages"] = captured
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
-        print(f"Done. Settled {settled}, skipped {skipped}.")
+        print(f"Done. Settled {settled}, skipped {skipped}, errors {errors}.")
         if skip_reasons:
             print("Skip reasons (sport:reason):")
             for key in sorted(skip_reasons):
