@@ -454,6 +454,26 @@ td.wrap {
   border-left: 4px solid var(--blue);
 }
 
+/* Visual distinction for paper trades whose odds came from the estimator
+   rather than a bookmaker quote. Dashed border + amber accent so it's
+   obvious at a glance which signals are model-priced. */
+.bet-card.estimated-card {
+  border-style: dashed;
+  background: linear-gradient(180deg, #0c141d 0%, #18170c 100%);
+}
+
+.badge.estimated-badge {
+  background: #3c2a10;
+  color: var(--amber);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.estimated-source {
+  color: var(--amber);
+  font-size: 0.85em;
+}
+
 .bet-top,
 .bet-meta {
   display: flex;

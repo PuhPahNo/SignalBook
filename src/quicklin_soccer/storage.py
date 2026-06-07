@@ -24,8 +24,19 @@ class QuicklinStore:
     def __init__(self, path: Path | str = DEFAULT_DB_PATH):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path)
+        # timeout=15 lets a writer wait up to 15s for the lock instead of
+        # immediately failing — needed now that the bot loop and the settle
+        # subprocess share this database.
+        self.conn = sqlite3.connect(self.path, timeout=15)
         self.conn.row_factory = sqlite3.Row
+        # WAL mode allows the scan loop to keep reading while the settle
+        # subprocess is writing, and vice versa. Safe to set every time;
+        # SQLite no-ops it if already in WAL.
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError:
+            pass
         self.init_schema()
 
     def close(self) -> None:
@@ -229,6 +240,30 @@ class QuicklinStore:
                 created_at TEXT NOT NULL
             );
 
+            -- Records every scan in which the model would have emitted a
+            -- new value_signal but was blocked by the open-trade dedup.
+            -- Used for post-hoc analysis: did the dedup-by-side policy
+            -- cost us EV when the line moved? Each row is a "would-have-bet"
+            -- snapshot linked back to the original open signal.
+            CREATE TABLE IF NOT EXISTS line_movements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER NOT NULL REFERENCES value_signals(id),
+                match_id INTEGER NOT NULL,
+                sport TEXT NOT NULL,
+                strategy_version TEXT NOT NULL,
+                side TEXT NOT NULL,
+                observed_line REAL NOT NULL,
+                observed_odds REAL,
+                observed_at TEXT NOT NULL,
+                odds_source TEXT NOT NULL DEFAULT 'market',
+                odds_confidence REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_line_movements_signal
+            ON line_movements(signal_id);
+            CREATE INDEX IF NOT EXISTS idx_line_movements_match
+            ON line_movements(match_id, observed_at);
+
             CREATE INDEX IF NOT EXISTS idx_value_signals_open_unique
             ON value_signals(match_id, sport, strategy_version, side, line, status);
             """
@@ -251,6 +286,14 @@ class QuicklinStore:
         self._ensure_column("run_metadata", "sport", "TEXT NOT NULL DEFAULT 'soccer'")
         self._ensure_column("skipped_candidates", "sport", "TEXT NOT NULL DEFAULT 'soccer'")
         self._ensure_column("historical_matches", "sport", "TEXT NOT NULL DEFAULT 'soccer'")
+        # Odds-estimator columns (Anthony's "estimated paper trades" feature).
+        # These let the dashboard render estimated signals visually distinct,
+        # while the settle flow treats them identically to market-priced ones.
+        self._ensure_column("odds_quotes", "is_estimated", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("odds_quotes", "estimation_method", "TEXT")
+        self._ensure_column("odds_quotes", "estimation_confidence", "REAL")
+        self._ensure_column("value_signals", "odds_source", "TEXT NOT NULL DEFAULT 'market'")
+        self._ensure_column("value_signals", "odds_confidence", "REAL")
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         columns = {row["name"] for row in self.conn.execute(f"PRAGMA table_info({table})")}
@@ -373,9 +416,10 @@ class QuicklinStore:
             """
             INSERT INTO odds_quotes (
                 match_id, sport, provider, bookmaker, captured_at, market, period, line, side,
-                decimal_odds, is_suspended, is_blocked, raw_json
+                decimal_odds, is_suspended, is_blocked, raw_json,
+                is_estimated, estimation_method, estimation_confidence
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 match_id,
@@ -391,6 +435,9 @@ class QuicklinStore:
                 int(quote.is_suspended),
                 int(quote.is_blocked),
                 _json(quote.raw),
+                int(quote.is_estimated),
+                quote.estimation_method,
+                quote.estimation_confidence,
             ),
         )
         self.conn.commit()
@@ -436,9 +483,10 @@ class QuicklinStore:
             INSERT INTO value_signals (
                 match_id, snapshot_id, prediction_id, odds_quote_id, sport, strategy_version, created_at,
                 side, line, offered_odds, fair_probability, fair_odds, ev, stake_units,
-                expected_goals_remaining, expected_total_remaining, confidence, reason_codes
+                expected_goals_remaining, expected_total_remaining, confidence, reason_codes,
+                odds_source, odds_confidence
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 match_id,
@@ -459,6 +507,8 @@ class QuicklinStore:
                 signal.expected_total_remaining,
                 signal.confidence,
                 _json(signal.reason_codes),
+                signal.odds_source,
+                signal.odds_confidence,
             ),
         )
         self.conn.commit()
@@ -482,7 +532,49 @@ class QuicklinStore:
         ).fetchone()
         return int(row["id"]) if row else None
 
+    def insert_line_movement(
+        self,
+        signal_id: int,
+        match_id: int,
+        signal: ValueSignal,
+    ) -> int:
+        """Record the would-have-emitted line/odds for a scan that was
+        blocked by the open-trade dedup. Lets Anthony measure later
+        whether holding the original bet through line movement cost
+        EV vs re-pricing on each scan."""
+        cursor = self.conn.execute(
+            """
+            INSERT INTO line_movements (
+                signal_id, match_id, sport, strategy_version, side,
+                observed_line, observed_odds, observed_at,
+                odds_source, odds_confidence
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                signal_id,
+                match_id,
+                signal.sport,
+                signal.strategy_version,
+                signal.side,
+                signal.line,
+                signal.offered_odds,
+                now_iso(),
+                signal.odds_source,
+                signal.odds_confidence,
+            ),
+        )
+        self.conn.commit()
+        return int(cursor.lastrowid)
+
     def emitted_signal_id(self, match_id: int, signal: ValueSignal) -> int | None:
+        """Return the id of an existing OPEN signal for this match+side that
+        we should dedupe against, regardless of line. The bot calls this
+        before emitting a new value_signal — if a paper trade is already
+        open on this side of this market, the new candidate is a duplicate
+        (the original bet stands until settled). A moved line does NOT
+        spawn a new paper trade; the move is logged separately to
+        line_movements for post-hoc EV analysis."""
         row = self.conn.execute(
             """
             SELECT id
@@ -491,11 +583,11 @@ class QuicklinStore:
               AND sport = ?
               AND strategy_version = ?
               AND side = ?
-              AND line = ?
+              AND status = 'open'
             ORDER BY id DESC
             LIMIT 1
             """,
-            (match_id, signal.sport, signal.strategy_version, signal.side, signal.line),
+            (match_id, signal.sport, signal.strategy_version, signal.side),
         ).fetchone()
         return int(row["id"]) if row else None
 
