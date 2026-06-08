@@ -322,42 +322,37 @@ function table(rows, kind) {
 function betSlip(rows) {
   const openRows = rows.filter((row) => row.status === "open");
   if (!openRows.length) {
-    return '<div class="empty-slip"><strong>No open bet candidates.</strong><span>The SignalBook bot keeps scanning and will drop cards here when a signal clears the model gates.</span></div>';
+    return '<div class="empty-slip"><strong>No open predictions.</strong><span>The SignalBook bot keeps scanning and will lock one over/under call per game once it reaches the per-sport checkpoint.</span></div>';
   }
   return `
     <div class="slip-board">
       ${openRows.map((row) => {
-        const isEstimated = row.odds_source && row.odds_source !== "market";
-        const estTag = isEstimated
-          ? `<span class="badge estimated-badge" title="Odds were estimated by SignalBook because the bookmaker did not post a two-sided total. ${escapeHtml(row.odds_source)}, confidence ${escapeHtml(formatPercent(row.odds_confidence))}.">[ESTIMATED] ${escapeHtml(formatPercent(row.odds_confidence))}</span>`
-          : "";
+        const lineSource = (row.odds_source || "").replace("prediction_", "");
         return `
-        <article class="bet-card ${row.side === "over" ? "over-card" : "under-card"} ${isEstimated ? "estimated-card" : ""}">
+        <article class="bet-card ${row.side === "over" ? "over-card" : "under-card"}">
           <div class="bet-top">
             <span class="badge ${badgeClass(row.sport)}">${escapeHtml(row.sport)}</span>
             <span class="badge ${badgeClass(row.side)}">${escapeHtml(row.side)}</span>
-            ${estTag}
+            ${lineSource ? `<span class="badge">${escapeHtml(lineSource)}</span>` : ""}
             <span class="freshness">${escapeHtml(relativeAge(row.created_at))}</span>
           </div>
           <div class="bet-pick">${escapeHtml(row.side.toUpperCase())} ${escapeHtml(row.line)}</div>
           <div class="bet-match">${escapeHtml(row.match)}</div>
           <div class="bet-grid">
-            <div><span>Odds${isEstimated ? " (est)" : ""}</span><strong>${escapeHtml(formatNumber(row.offered_odds, 2))}</strong></div>
-            <div><span>Stake</span><strong>${escapeHtml(formatNumber(row.stake_units, 2))}u</strong></div>
-            <div><span>Model fair</span><strong>${escapeHtml(formatNumber(row.fair_odds, 2))}</strong></div>
-            <div><span>Edge</span><strong>${escapeHtml(formatPercent(row.ev))}</strong></div>
+            <div><span>Confidence</span><strong>${escapeHtml(formatPercent(row.confidence))}</strong></div>
+            <div><span>Line</span><strong>${escapeHtml(row.line)}</strong></div>
+            <div><span>Line source</span><strong>${escapeHtml(lineSource || "—")}</strong></div>
+            <div><span>Model +rem</span><strong>${escapeHtml(formatNumber(row.expected_goals_remaining, 1))}</strong></div>
           </div>
           <div class="bet-meta">
             <span>${escapeHtml(row.strategy_version)}</span>
-            <span>confidence ${escapeHtml(formatPercent(row.confidence))}</span>
-            ${isEstimated ? `<span class="estimated-source">${escapeHtml(row.odds_source)}</span>` : ""}
           </div>
           <a class="bet-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">${icon("external")}Open AIScore</a>
         </article>
       `;
       }).join("")}
     </div>
-    <div class="slip-note">Paper-trading candidates only. Check the live book line/odds before acting; odds move fast.</div>
+    <div class="slip-note">Live over/under predictions, locked at the per-sport checkpoint and graded by hit rate vs base rate — not bets.</div>
   `;
 }
 
@@ -368,14 +363,10 @@ function columnsFor(kind, sample) {
       { key: "sport", label: "Sport", badge: true },
       { key: "created_at", label: "Time" },
       { key: "match", label: "Match", wrap: true },
-      { key: "side", label: "Side", badge: true },
+      { key: "side", label: "Call", badge: true },
       { key: "line", label: "Line" },
-      { key: "offered_odds", label: "Odds" },
-      { key: "fair_odds", label: "Fair" },
-      { key: "ev", label: "EV", pct: true },
-      { key: "confidence", label: "Conf", pct: true },
-      { key: "odds_source", label: "Odds source", badge: true },
-      { key: "odds_confidence", label: "Est. conf", pct: true },
+      { key: "confidence", label: "Confidence", pct: true },
+      { key: "odds_source", label: "Line source", badge: true },
       { key: "status", label: "Status", badge: true },
     ],
     snapshots: [
@@ -411,16 +402,15 @@ function columnsFor(kind, sample) {
     performance: [
       { key: "sport", label: "Sport", badge: true },
       { key: "strategy_version", label: "Strategy", wrap: true },
-      { key: "signals", label: "Signals" },
+      { key: "line_source", label: "Line", badge: true },
       { key: "open_signals", label: "Open" },
       { key: "settled", label: "Settled" },
-      { key: "wins", label: "Wins" },
-      { key: "pushes", label: "Pushes" },
-      { key: "losses", label: "Losses" },
       { key: "hit_rate", label: "Hit", pct: true },
-      { key: "profit_units", label: "Profit" },
-      { key: "roi", label: "ROI", pct: true },
-      { key: "avg_model_ev", label: "Avg EV", pct: true },
+      { key: "base_rate", label: "Base", pct: true },
+      { key: "edge", label: "Edge", pct: true },
+      { key: "over_picks", label: "Over" },
+      { key: "under_picks", label: "Under" },
+      { key: "avg_stage", label: "Stage" },
       { key: "avg_confidence", label: "Conf", pct: true },
     ],
     health: [

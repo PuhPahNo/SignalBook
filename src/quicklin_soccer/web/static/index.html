@@ -26,7 +26,7 @@
       <div class="toolbar">
         <div>
           <h1>SignalBook Bot</h1>
-          <div class="subtle">Automatic AIScore scans, paper signals, and settlement tracking</div>
+          <div class="subtle">Live in-game over/under predictions, graded by win rate vs base rate</div>
         </div>
         <div class="actions">
           <button class="primary" id="botToggleBtn" data-icon="repeat">Bot Starting</button>
@@ -51,7 +51,7 @@
       <div class="notice" id="interpretation">Loading...</div>
 
       <section class="view active" id="signals">
-        <div class="panel"><div class="panel-head">Signals <span class="subtle">expected-value candidates</span></div><div id="signalsTable"></div></div>
+        <div class="panel"><div class="panel-head">Predictions <span class="subtle">live over/under calls, one per game</span></div><div id="signalsTable"></div></div>
       </section>
       <section class="view" id="model">
         <div class="panel">
@@ -75,7 +75,7 @@
         <div class="panel"><div class="panel-head">Settlements <span class="subtle">paper-trading results</span></div><div id="settlementsTable"></div></div>
       </section>
       <section class="view" id="performance">
-        <div class="panel"><div class="panel-head">Performance <span class="subtle">accuracy by sport and strategy</span></div><div id="performanceTable"></div></div>
+        <div class="panel"><div class="panel-head">Performance <span class="subtle">hit rate vs base rate — edge is the skill</span></div><div id="performanceTable"></div></div>
       </section>
       <section class="view" id="health">
         <div class="panel"><div class="panel-head">Provider Health <span class="subtle">latest scanner diagnostics</span></div><div id="healthTable"></div></div>

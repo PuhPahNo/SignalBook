@@ -140,35 +140,59 @@ def settlements_query(sport: str | None = None) -> str:
 
 
 def performance_query(sport: str | None = None) -> str:
+    # Win-rate view. The model makes a live over/under CALL; the only honest
+    # metric is the hit rate vs the BASE RATE — how often that side hits anyway.
+    # base_rate = the best always-one-side strategy (max of over/under outcome
+    # frequency); edge = hit_rate - base_rate. A high hit rate with ~0 edge is
+    # the model just riding the base rate (e.g. always 'under' on high lines),
+    # not skill. Grouped by line source so sharp (pinnacle) and soft
+    # (aiscore_open) reference lines are judged separately. No profit/ROI/EV —
+    # those needed live odds, which don't exist for free.
     return """
-        SELECT value_signals.sport, value_signals.strategy_version,
-               COUNT(value_signals.id) AS signals,
-               SUM(CASE WHEN value_signals.status = 'open' THEN 1 ELSE 0 END) AS open_signals,
-               COUNT(settlements.id) AS settled,
-               SUM(CASE WHEN settlements.payout_units > 0 THEN 1 ELSE 0 END) AS wins,
-               SUM(CASE WHEN settlements.result = 'push' THEN 1 ELSE 0 END) AS pushes,
-               SUM(CASE WHEN settlements.payout_units < 0 THEN 1 ELSE 0 END) AS losses,
-               CASE WHEN COUNT(settlements.id) = 0 THEN NULL
+        SELECT t.*,
+               CASE WHEN t.settled = 0 THEN NULL
                     ELSE ROUND(
-                        SUM(CASE WHEN settlements.payout_units > 0 THEN 1.0 ELSE 0 END) / COUNT(settlements.id),
-                        4
-                    )
-               END AS hit_rate,
-               ROUND(COALESCE(SUM(settlements.payout_units), 0), 4) AS profit_units,
-               ROUND(COALESCE(SUM(CASE WHEN settlements.id IS NOT NULL THEN value_signals.stake_units ELSE 0 END), 0), 4) AS settled_stake_units,
-               CASE WHEN SUM(CASE WHEN settlements.id IS NOT NULL THEN value_signals.stake_units ELSE 0 END) = 0 THEN NULL
+                        (CASE WHEN t.results_over >= t.results_under THEN t.results_over ELSE t.results_under END)
+                        * 1.0 / t.settled, 4)
+               END AS base_rate,
+               CASE WHEN t.settled = 0 OR t.hit_rate IS NULL THEN NULL
                     ELSE ROUND(
-                        SUM(settlements.payout_units) / SUM(CASE WHEN settlements.id IS NOT NULL THEN value_signals.stake_units ELSE 0 END),
-                        4
-                    )
-               END AS roi,
-               ROUND(AVG(value_signals.ev), 4) AS avg_model_ev,
-               ROUND(AVG(value_signals.confidence), 4) AS avg_confidence
-        FROM value_signals
-        LEFT JOIN settlements ON settlements.signal_id = value_signals.id
-        """ + _where_sport(sport, "value_signals") + """
-        GROUP BY value_signals.sport, value_signals.strategy_version
-        ORDER BY settled DESC, signals DESC, value_signals.sport
+                        t.hit_rate
+                        - (CASE WHEN t.results_over >= t.results_under THEN t.results_over ELSE t.results_under END)
+                          * 1.0 / t.settled, 4)
+               END AS edge
+        FROM (
+            SELECT value_signals.sport AS sport,
+                   value_signals.strategy_version AS strategy_version,
+                   COALESCE(value_signals.odds_source, 'market') AS line_source,
+                   COUNT(value_signals.id) AS signals,
+                   SUM(CASE WHEN value_signals.status = 'open' THEN 1 ELSE 0 END) AS open_signals,
+                   COUNT(settlements.id) AS settled,
+                   SUM(CASE WHEN settlements.payout_units > 0 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN settlements.result = 'push' THEN 1 ELSE 0 END) AS pushes,
+                   SUM(CASE WHEN settlements.payout_units < 0 THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN settlements.id IS NOT NULL AND value_signals.side = 'over' THEN 1 ELSE 0 END) AS over_picks,
+                   SUM(CASE WHEN settlements.id IS NOT NULL AND value_signals.side = 'under' THEN 1 ELSE 0 END) AS under_picks,
+                   SUM(CASE WHEN settlements.id IS NOT NULL
+                            AND (settlements.final_home_score + settlements.final_away_score) > value_signals.line
+                            THEN 1 ELSE 0 END) AS results_over,
+                   SUM(CASE WHEN settlements.id IS NOT NULL
+                            AND (settlements.final_home_score + settlements.final_away_score) < value_signals.line
+                            THEN 1 ELSE 0 END) AS results_under,
+                   CASE WHEN COUNT(settlements.id) = 0 THEN NULL
+                        ELSE ROUND(
+                            SUM(CASE WHEN settlements.payout_units > 0 THEN 1.0 ELSE 0 END) / COUNT(settlements.id),
+                            4)
+                   END AS hit_rate,
+                   ROUND(AVG(live_snapshots.minute), 1) AS avg_stage,
+                   ROUND(AVG(value_signals.confidence), 4) AS avg_confidence
+            FROM value_signals
+            LEFT JOIN settlements ON settlements.signal_id = value_signals.id
+            LEFT JOIN live_snapshots ON live_snapshots.id = value_signals.snapshot_id
+            """ + _where_sport(sport, "value_signals") + """
+            GROUP BY value_signals.sport, value_signals.strategy_version, COALESCE(value_signals.odds_source, 'market')
+        ) t
+        ORDER BY t.settled DESC, t.signals DESC, t.sport
     """
 
 
