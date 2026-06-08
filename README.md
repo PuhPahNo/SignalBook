@@ -1,8 +1,8 @@
 # SignalBook Multi-Sport
 
-SignalBook is a local multi-sport betting-research tool. It scans AIScore live matches, stores every snapshot in SQLite, evaluates exact live totals lines for expected value, paper-trades signals, settles them later, and produces local reports.
+SignalBook is a local multi-sport betting-research tool. It scans AIScore live matches, stores every snapshot in SQLite, and — at a fixed per-sport checkpoint — locks ONE live over/under prediction per game from in-game performance, graded against a reference total (Pinnacle's sharp opening line where available, else AIScore's). Predictions settle at game end and are scored by **win rate vs base rate** (edge = the model's skill over always picking one side).
 
-It does not place real bets.
+It does not place real bets. The default `--mode predict` is a prediction/accuracy tracker, not a value-betting bot: live in-play odds aren't available for free (both AIScore and Pinnacle's guest API serve only frozen pre-match totals), so EV/ROI can't be computed honestly. The legacy EV value-betting path remains under `--mode value`.
 
 ## Requirements
 
@@ -99,9 +99,13 @@ Import free Football-Data.co.uk CSVs and run the baseline backtest:
 
 This is a historical baseline only. Free public data does not provide historical live in-play odds snapshots, so live strategy validation comes from forward paper trading.
 
-## Strategies
+## Prediction model (`--mode predict`, default)
 
-- `ev_totals_v1` is the default. It estimates remaining goals, prices the exact live line, and emits only positive-EV signals.
+At each sport's checkpoint (soccer 45', basketball 24', hockey 30', baseball 4th inning, tennis 2nd set) the model locks one over/under call per game. Expected remaining scoring is estimated from in-game pace (not anchored to the line), the side with the higher modelled probability is taken, and it's settled at game end. The Performance view reports hit rate, base rate, and edge per sport, strategy, and line source.
+
+## Strategies (used for the prediction's probability, and for `--mode value`)
+
+- `ev_totals_v1` is the soccer default. It estimates remaining goals and prices the live line.
 - `legacy_threshold_v1` preserves the old threshold logic for comparison.
 - `hockey_totals_v1`, `basketball_totals_v1`, and `baseball_totals_v1` use the latest stored free-source league baselines when calibration has run.
 - `tennis_match_totals_v1` stays conservative because a stable free ATP JSON calibration source is not wired in yet.
@@ -111,6 +115,6 @@ Outputs are candidate signals for research, not guaranteed profitable bets.
 ## Troubleshooting
 
 - If Chrome does not launch, update Chrome or install Chromium, then rerun the command.
-- If no signals appear, check the Skips, Provider Health, and Jobs views. The provider may have found no live games, no supported totals odds, or no model edge.
+- If no predictions appear, check the Skips view: games may be before their checkpoint, already predicted, or missing a reference line (no Pinnacle match and no AIScore total).
 - If AIScore changes its page markup, parser tests may still pass while live scraping needs an update.
 - Delete `data/quicklin.db` only if you intentionally want to reset local paper-trading history.
