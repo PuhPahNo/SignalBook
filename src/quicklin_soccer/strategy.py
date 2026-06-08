@@ -13,6 +13,7 @@ from quicklin_soccer.models import (
     now_iso,
 )
 from quicklin_soccer.models import MatchStats
+from quicklin_soccer.odds_estimator import OddsEstimator
 from quicklin_soccer.pricing import (
     expected_total_exposure,
     is_supported_total_line,
@@ -340,6 +341,94 @@ def evaluate_sport_totals(
         return EvEvaluation(prediction, (), "no_edge", {"min_ev": config.min_ev, "sport": snapshot.sport})
     signals.sort(key=lambda signal: signal.expected_value, reverse=True)
     return EvEvaluation(prediction, tuple(signals), None, None)
+
+
+# --------------------------------------------------------------------------
+# Win-rate prediction model.
+#
+# The bot's purpose is a live, in-game over/under CALL graded by hit rate — no
+# odds, no EV. At a fixed per-sport checkpoint (enough in-game signal, outcome
+# still in doubt) the model locks ONE directional prediction against a reference
+# line (Pinnacle's opening total), settled at game end. The checkpoint is what
+# keeps the win rate honest: a call locked late, after the line is already
+# decided, is a trivial "win" that inflates the rate.
+# --------------------------------------------------------------------------
+
+# Checkpoint in each sport's snapshot.minute units (soccer/basketball/hockey:
+# elapsed minutes; baseball: inning index; tennis: set index). Roughly the
+# game's midpoint — past it the in-game read is informative but the total is
+# usually still undecided.
+PREDICTION_CHECKPOINTS = {
+    SPORT_SOCCER: 45,      # halftime
+    SPORT_BASKETBALL: 24,  # halftime
+    SPORT_HOCKEY: 30,      # midway (into the 2nd period)
+    SPORT_BASEBALL: 4,     # entering the 4th inning
+    SPORT_TENNIS: 2,       # into the 2nd set
+}
+
+
+_PREDICTION_ESTIMATOR = OddsEstimator()
+
+
+@dataclass(frozen=True)
+class TotalPrediction:
+    side: str  # "over" | "under"
+    line: float
+    confidence: float  # model P(predicted side), in [0, 1]
+    expected_total: float
+    expected_remaining: float
+    over_probability: float
+
+
+def checkpoint_minute(sport: str) -> int:
+    return PREDICTION_CHECKPOINTS.get(sport, 45)
+
+
+def at_checkpoint(snapshot: LiveSnapshot) -> bool:
+    """True once the game has reached its sport's prediction checkpoint."""
+    return snapshot.minute >= checkpoint_minute(snapshot.sport)
+
+
+def _predicted_remaining(snapshot: LiveSnapshot, line: float, config: StrategyConfig) -> float:
+    """Expected remaining scoring, estimated from PACE and time left — NOT
+    anchored to the line. The legacy estimate_expected_total_remaining() pulls
+    toward `line - current`, which only makes sense for a live total; against a
+    fixed pre-match line it badly misjudges late games (it thought ~6 runs were
+    left in the 8th of a 2-run game). OddsEstimator's per-sport pace model is
+    the line-independent read; fall back to the legacy estimate where it has no
+    model (e.g. tennis)."""
+    estimated = _PREDICTION_ESTIMATOR.estimate(snapshot, snapshot.sport)
+    if estimated is not None:
+        return estimated.expected_total_remaining
+    return estimate_expected_total_remaining(snapshot, line, config.calibration_metrics)
+
+
+def predict_total(
+    snapshot: LiveSnapshot,
+    line: float,
+    config: StrategyConfig | None = None,
+) -> TotalPrediction:
+    """The model's directional over/under call against `line`, from current
+    in-game performance. Picks the side it judges more likely; confidence is
+    that side's probability. No odds, no EV — this is a prediction, not a bet."""
+    config = config or StrategyConfig(strategy_version=sport_config(snapshot.sport).default_strategy)
+    expected_remaining = _predicted_remaining(snapshot, line, config)
+    max_remaining = _max_remaining_units(snapshot.sport, expected_remaining)
+    over_prob = expected_total_exposure(
+        snapshot.total_score, line, "over", expected_remaining, max_remaining
+    ).fair_probability
+    under_prob = expected_total_exposure(
+        snapshot.total_score, line, "under", expected_remaining, max_remaining
+    ).fair_probability
+    side = "over" if over_prob >= under_prob else "under"
+    return TotalPrediction(
+        side=side,
+        line=line,
+        confidence=round(max(over_prob, under_prob), 4),
+        expected_total=round(snapshot.total_score + expected_remaining, 3),
+        expected_remaining=expected_remaining,
+        over_probability=round(over_prob, 4),
+    )
 
 
 def estimate_expected_goals_remaining(

@@ -47,9 +47,12 @@ from quicklin_soccer.strategy import (
     LEGACY_STRATEGY_VERSION,
     SPORT_STRATEGY_VERSIONS,
     StrategyConfig,
+    at_checkpoint,
+    checkpoint_minute,
     evaluate_ev_totals,
     evaluate_match,
     evaluate_sport_totals,
+    predict_total,
 )
 from quicklin_soccer.webapp import run_server
 
@@ -96,20 +99,34 @@ def scan_command(args: argparse.Namespace) -> int:
                     match_id = store.upsert_match(ref)
                     try:
                         snapshot, odds_quotes = provider.get_live_snapshot(ref)
-                        # Prefer Pinnacle's live sharp total; AiScore odds are a
-                        # frozen pre-match line. Keep AiScore odds only as a
-                        # fallback when Pinnacle has no match for this game.
+                        snapshot_id = store.insert_snapshot(match_id, snapshot)
+                        summary["snapshots"] += 1
+
+                        if getattr(args, "mode", "predict") == "predict":
+                            # Win-rate mode: lock one over/under call per game at
+                            # the checkpoint, graded against the reference line
+                            # (Pinnacle sharp where available, else AiScore open).
+                            line, line_source = _prediction_line(
+                                ref, odds_quotes, pinnacle_client, pinnacle_games
+                            )
+                            _emit_prediction(
+                                store, args, match_id, snapshot_id, snapshot, ref,
+                                line, line_source, strategy_config, summary, rows,
+                            )
+                            continue
+
+                        # Legacy value-betting mode (--mode value). Prefer
+                        # Pinnacle's total; AiScore odds are a frozen pre-match
+                        # line kept only as a fallback when Pinnacle has no match.
                         pinnacle_quotes = _pinnacle_odds_for(
                             snapshot, ref, pinnacle_client, pinnacle_games, args.sport
                         )
                         if pinnacle_quotes:
                             odds_quotes = pinnacle_quotes
-                        snapshot_id = store.insert_snapshot(match_id, snapshot)
                         odds_ids = {
                             quote.side: store.insert_odds_quote(match_id, quote)
                             for quote in odds_quotes
                         }
-                        summary["snapshots"] += 1
                         history = None
                         if args.sport == SPORT_SOCCER:
                             try:
@@ -787,12 +804,19 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stake-units", type=float, default=1.0)
     parser.add_argument("--max-odds-age-seconds", type=int, default=120)
     parser.add_argument(
+        "--mode",
+        choices=["predict", "value"],
+        default="predict",
+        help="'predict' (default): lock one live over/under CALL per game at the "
+        "per-sport checkpoint, graded by win rate against the Pinnacle line (no "
+        "odds/EV). 'value': legacy EV value-betting against bookmaker odds.",
+    )
+    parser.add_argument(
         "--odds-source",
         choices=["pinnacle", "aiscore"],
         default="pinnacle",
-        help="Odds source. 'pinnacle' (default) uses Pinnacle's live sharp "
-        "totals; AiScore only serves a frozen pre-match line. 'aiscore' keeps "
-        "the legacy behavior. Game state/stats always come from AiScore.",
+        help="Value-mode odds source. 'pinnacle' (default) uses Pinnacle's "
+        "totals; 'aiscore' keeps the legacy behavior. Ignored in predict mode.",
     )
 
 
@@ -830,6 +854,7 @@ def _bot_scan_args(args: argparse.Namespace, sport: str) -> argparse.Namespace:
         stake_units=args.stake_units,
         max_odds_age_seconds=args.max_odds_age_seconds,
         odds_source=getattr(args, "odds_source", "pinnacle"),
+        mode=getattr(args, "mode", "predict"),
         output=None,
     )
 
@@ -924,6 +949,85 @@ def _pinnacle_setup(args: argparse.Namespace) -> tuple[Any | None, list]:
     except pinnacle.PinnacleError as exc:
         _print(args, f"Pinnacle unavailable, falling back to AiScore odds: {exc}")
         return None, []
+
+
+def _pinnacle_line_for(ref: MatchRef, client, games) -> float | None:
+    """The Pinnacle opening total (just the line) for one match, or None."""
+    if client is None or not games:
+        return None
+    game = pinnacle.find_game(ref.home_team, ref.away_team, games)
+    if game is None:
+        return None
+    try:
+        total = client.main_total(game.matchup_id)
+    except pinnacle.PinnacleError:
+        return None
+    return total.line if total else None
+
+
+def _prediction_line(ref: MatchRef, odds_quotes, client, games) -> tuple[float | None, str | None]:
+    """The reference line to grade the prediction against. Prefer Pinnacle's
+    sharp total; fall back to AiScore's opening total so the many leagues
+    Pinnacle doesn't carry (minor/international) still get predictions. Returns
+    (line, source) so win rate can be split by line quality."""
+    line = _pinnacle_line_for(ref, client, games)
+    if line is not None:
+        return line, "pinnacle"
+    for quote in odds_quotes:
+        if quote.line is not None:
+            return quote.line, "aiscore_open"
+    return None, None
+
+
+def _emit_prediction(store, args, match_id, snapshot_id, snapshot, ref, line, line_source, config, summary, rows) -> None:
+    """Win-rate mode: at the per-sport checkpoint, lock ONE over/under
+    prediction for this game against the reference line and record it. No odds,
+    no EV — the metric is the hit rate when settled at game end."""
+    if line is None:
+        _skip(store, args, match_id, snapshot_id, "no_reference_line", {})
+        summary["skips"] += 1
+        return
+    if not at_checkpoint(snapshot):
+        _skip(store, args, match_id, snapshot_id, "before_checkpoint",
+              {"minute": snapshot.minute, "checkpoint": checkpoint_minute(snapshot.sport)})
+        summary["skips"] += 1
+        return
+    if store.has_signal_for_match(match_id):
+        summary["duplicates"] += 1
+        return
+    pred = predict_total(snapshot, line, config)
+    signal = ValueSignal(
+        strategy_version=config.strategy_version,
+        created_at=now_iso(),
+        provider_match_id=snapshot.provider_match_id,
+        canonical_id=snapshot.canonical_id,
+        match_title=snapshot.title,
+        url=snapshot.url,
+        side=pred.side,
+        line=pred.line,
+        offered_odds=2.0,  # even-money placeholder; win rate is the metric, not profit
+        fair_probability=pred.confidence,
+        fair_odds=round(1 / pred.confidence, 4) if pred.confidence > 0 else None,
+        expected_value=0.0,
+        stake_units=config.stake_units,
+        expected_goals_remaining=pred.expected_remaining,
+        confidence=pred.confidence,
+        minute=snapshot.minute,
+        score=f"{snapshot.home_score}-{snapshot.away_score}",
+        bookmaker=line_source,
+        reason_codes=("prediction", f"checkpoint_{snapshot.sport}", f"line_{line_source}"),
+        sport=snapshot.sport,
+        odds_source=f"prediction_{line_source}",
+        odds_confidence=pred.confidence,
+    )
+    store.insert_signal(match_id, snapshot_id, None, None, signal)
+    summary["signals"] += 1
+    rows.append(signal.as_row())
+    _print(
+        args,
+        f"prediction: {pred.side.upper()} {pred.line} ({line_source}) "
+        f"(P={pred.confidence:.0%}, exp_total={pred.expected_total}) @ {snapshot.minute}",
+    )
 
 
 def _pinnacle_odds_for(snapshot, ref: MatchRef, client, games, sport: str) -> tuple[OddsQuote, ...]:

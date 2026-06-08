@@ -567,6 +567,15 @@ class QuicklinStore:
         self.conn.commit()
         return int(cursor.lastrowid)
 
+    def has_signal_for_match(self, match_id: int) -> bool:
+        """True if any signal already exists for this match. The win-rate model
+        locks exactly ONE prediction per game (at the checkpoint), so this guards
+        against re-predicting on every later scan of the same match."""
+        row = self.conn.execute(
+            "SELECT 1 FROM value_signals WHERE match_id = ? LIMIT 1", (match_id,)
+        ).fetchone()
+        return row is not None
+
     def emitted_signal_id(self, match_id: int, signal: ValueSignal) -> int | None:
         """Return the id of an existing OPEN signal for this match+side that
         we should dedupe against, regardless of line. The bot calls this
